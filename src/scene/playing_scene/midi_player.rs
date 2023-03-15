@@ -35,53 +35,193 @@ impl MidiPlayer {
         player
     }
 
-    /// When playing: returns midi events
-    ///
-    /// When paused: returns None
-    pub fn update(
-        &mut self,
-        target: &mut Target,
-        delta: Duration,
+    /// Variance
+pub fn update(
+    &mut self,
+    target: &mut Target,
+    delta: Duration,
     ) -> Option<Vec<lib_midi::MidiEvent>> {
-        rewind_controler::update(self, target);
+    rewind_controler::update(self, target);
 
-        let elapsed = (delta / 10) * (target.config.speed_multiplier * 10.0) as u32;
+    let elapsed = (delta / 10) * (target.config.speed_multiplier * 10.0) as u32;
 
-        let events = self.playback.update(&self.midi_file.merged_track, elapsed);
+    let mut events = self.playback.update(&self.midi_file.merged_track, elapsed);
 
-        events.iter().for_each(|event| {
-            use lib_midi::midly::MidiMessage;
-            match event.message {
-                MidiMessage::NoteOn { key, vel } => {
-                    let event = midi::Message::NoteOn(
-                        midi::Channel::from_u8(event.channel).unwrap(),
-                        key.as_int(),
-                        vel.as_int(),
-                    );
-                    self.output_manager.borrow_mut().midi_event(event);
-                    self.play_along
-                        .press_key(KeyPressSource::File, key.as_int(), true);
-                }
-                MidiMessage::NoteOff { key, .. } => {
-                    let event = midi::Message::NoteOff(
-                        midi::Channel::from_u8(event.channel).unwrap(),
-                        key.as_int(),
-                        0,
-                    );
-                    self.output_manager.borrow_mut().midi_event(event);
-                    self.play_along
-                        .press_key(KeyPressSource::File, key.as_int(), false);
-                }
-                _ => {}
+    // Get the timestamp of the next note in the MIDI file
+    let next_note_timestamp = events
+        .iter()
+        .filter_map(|event| match event.message {
+            MidiMessage::NoteOn { key, .. } => Some(key.timestamp),
+            _ => None,
+        })
+        .min();
+
+    // If there are no more notes in the MIDI file, assume the user has finished
+    let user_finished = next_note_timestamp.is_none();
+
+    // Calculate the acceptable error range
+    let error_range = if user_finished {
+        // If the user has finished, the acceptable error range is infinity
+        None
+    } else {
+        let max_latency = Duration::from_millis(300);
+        let time_left = next_note_timestamp.unwrap() - elapsed;
+        let max_latency = max_latency.min(time_left);
+        let min_latency = max_latency.neg();
+        Some((min_latency, max_latency))
+    };
+
+    // Handle user input
+    let mut note_pressed = false;
+    let mut note_released = false;
+    let mut user_latency = None;
+    if let Some(key) = self.play_along.get_current_key() {
+        let user_timestamp = key.timestamp;
+        if let Some((min_latency, max_latency)) = error_range {
+            if user_timestamp >= min_latency && user_timestamp <= max_latency {
+                user_latency = Some(user_timestamp - next_note_timestamp.unwrap());
+                note_pressed = key.is_pressed();
+                note_released = !key.is_pressed();
             }
-        });
-
-        if self.playback.is_paused() {
-            None
-        } else {
-            Some(events)
         }
     }
+
+    // Determine the state based on the user's latency
+    let state = match user_latency {
+        Some(latency) if latency <= Duration::from_millis(50) => "perfect",
+        Some(latency) if latency <= Duration::from_millis(100) => "little late",
+        Some(latency) if latency <= Duration::from_millis(200) => "late",
+        Some(latency) if latency <= Duration::from_millis(300) => "late",
+        Some(latency) if latency >= Duration::from_millis(-50) => "perfect",
+        Some(latency) if latency >= Duration::from_millis(-100) => "little early",
+        Some(latency) if latency >= Duration::from_millis(-200) => "early",
+        _ => "",
+    };
+
+    // Handle MIDI events
+    events.retain(|event| match event.message {
+        MidiMessage::NoteOn { key, vel } => {
+            let event = midi::Message::NoteOn(
+                midi::Channel::from_u8(event.channel).unwrap(),
+                key.as_int(),
+                vel.as_int(),
+            );
+            self.output_manager.borrow_mut().midi_event(event);
+            self.play_along.press_key(KeyPressSource::File, key.as_int(), true);
+            true
+        }
+        MidiMessage::NoteOff { key, .. } => {
+            let event = midi::Message::NoteOff(
+                midi::Channel::from_u8(event.channel).unwrap(),
+                key.as_int(),
+                0,
+            );
+            self.output_manager.borrow_mut().midi_event(event);
+            self.play_along.press
+            // Find the earliest note that hasn't been played yet
+            let next_note = self
+            .midi_file
+            .merged_track
+            .iter()
+            .filter_map(|event| match event.message {
+            MidiMessage::NoteOn { key, .. } => Some((event.delta.as_int(), key.as_int())),
+            _ => None,
+            })
+            .find(|(delta, )| *delta >= self.playback.pos)
+            .map(|(, key)| key);
+                let time_since_next_note = next_note
+        .map(|key| {
+            let next_note_timestamp = self
+                .midi_file
+                .merged_track
+                .iter()
+                .filter_map(|event| match event.message {
+                    MidiMessage::NoteOn { key: k, .. } if k == key => Some(event.delta),
+                    _ => None,
+                })
+                .next()
+                .unwrap();
+
+            let next_note_elapsed = self.playback.pos - next_note_timestamp.as_int();
+
+            (next_note_elapsed as f32 / 10.0) * target.config.speed_multiplier
+        })
+        .unwrap_or(0.0);
+
+    let elapsed_with_lead = (elapsed as f32 + time_since_next_note) as u32;
+
+    let events = self
+        .playback
+        .update(&self.midi_file.merged_track, elapsed_with_lead);
+
+    // Check if the user's input matches a note in the file
+    let input_match = self.check_input_match(target);
+
+    // Determine the timing of the user's input relative to the nearest note in the file
+    let timing = if let Some((expected_time, _)) = input_match {
+        let delta = expected_time as i32 - self.playback.pos as i32;
+        if delta < -300 {
+            Timing::Early
+        } else if delta < -100 {
+            Timing::LittleEarly
+        } else if delta < 100 {
+            Timing::Perfect
+        } else if delta < 300 {
+            Timing::LittleLate
+        } else {
+            Timing::Late
+        }
+    } else {
+        Timing::None
+    };
+
+    // Handle the user's input based on the timing
+    match timing {
+        Timing::Perfect => {
+            self.handle_input_match(target, true);
+        }
+        Timing::Early | Timing::LittleEarly => {
+            self.handle_input_match(target, false);
+            target.combo.reset();
+        }
+        Timing::Late | Timing::LittleLate => {
+            self.handle_input_miss(target);
+            target.combo.reset();
+        }
+        Timing::None => {}
+    }
+
+    events.iter().for_each(|event| {
+        use lib_midi::midly::MidiMessage;
+        match event.message {
+            MidiMessage::NoteOn { key, vel } => {
+                let event = midi::Message::NoteOn(
+                    midi::Channel::from_u8(event.channel).unwrap(),
+                    key.as_int(),
+                    vel.as_int(),
+                );
+                self.output_manager.borrow_mut().midi_event(event);
+                self.play_along
+                    .press_key(KeyPressSource::File, key.as_int(), true);
+            }
+            MidiMessage::NoteOff { key, .. } => {
+                let event = midi::Message::NoteOff(
+                    midi::Channel::from_u8(event.channel).unwrap(),
+                    key.as_int(),
+                    0,
+                );
+                self.output_manager.borrow_mut().midi_event(event);
+                self.play_along
+                    .press_key(KeyPressSource::File, key.as_int(), false);
+            }
+            _ => {}
+        }
+    });
+
+    None
+}
+    
+    
 
     fn clear(&mut self) {
         let mut output = self.output_manager.borrow_mut();
