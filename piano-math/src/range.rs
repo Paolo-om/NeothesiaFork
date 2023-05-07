@@ -1,5 +1,6 @@
 #![allow(dead_code)] // allows unused code to prevent warnings
 
+use std::ops::{Range, RangeBounds};
 // Define some constants for black keys
 const KEY_CIS: u8 = 1;
 const KEY_DIS: u8 = 3;
